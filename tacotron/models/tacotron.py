@@ -44,7 +44,7 @@ class Tacotron():
 	def initialize(self, inputs, input_lengths, mel_targets=None, stop_token_targets=None, linear_targets=None,
 				   targets_lengths=None, gta=False,
 				   global_step=None, is_training=False, is_evaluating=False, split_infos=None, dur_targets=None,
-				   alignment_targets=None,a=None):
+				   alignment_targets=None,a=None,alignment_inputs=None):
 		"""
 		Initializes the model for inference
 		sets "mel_outputs" and "alignments" fields.
@@ -132,6 +132,7 @@ class Tacotron():
 		self.tower_decoder_output = []
 		self.tower_dur_output = []
 		self.tower_alignments = []
+		self.max_dur=[]
 		self.tower_stop_token_prediction = []
 		self.tower_mel_outputs = []
 		self.tower_linear_outputs = []
@@ -176,12 +177,32 @@ class Tacotron():
 					encoder_outputs = encoder_cell(embedded_inputs, tower_input_lengths[i])
 					Dur = duration(hparams=hp, training=is_training)
 					dur_out = Dur(encoder_outputs)
+					d_model=encoder_outputs.get_shape().as_list()[-1]
+
+					# Decoder Cell ==> [batch_size, decoder_steps, num_mels * r] (after decoding)
+					if  alignment_targets is not None :
+						encoder_outputs,_=length_regulator(encoder_outputs,tf.cast(tf.argmax(dur_targets,axis=-1),tf.int32))
+						T_y = tower_targets_lengths[i]
+						encoder_outputs+=positional_encoding(encoder_outputs,tower_targets_lengths[i])
+						encoder_outputs=tf.reshape(encoder_outputs,[batch_size,tf.reduce_max(T_y),d_model])
+						align_dur=tf.tile(tf.expand_dims(tf.eye(tf.reduce_max(T_y)),axis=0),[batch_size,1,1])
+						align_dur=tf.transpose(align_dur,perm=[1,0,2])
+						align_dur = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True).unstack(align_dur)
 
 
 
-					# For shape visualization purpose
+					else:
+						encoder_outputs, T_y = length_regulator(encoder_outputs,
+															  tf.cast(tf.argmax(dur_out, axis=-1), tf.int32))
+						encoder_outputs += positional_encoding(encoder_outputs, T_y)
+
+						align_dur = tf.tile(tf.expand_dims(tf.eye(tf.reduce_max(T_y)), axis=0),
+											[batch_size, 1, 1])
+						align_dur = tf.transpose(align_dur, perm=[1, 0, 2])
+						align_dur = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True).unstack(align_dur)
+
+
 					enc_conv_output_shape = encoder_cell.conv_output_shape
-
 					# Decoder Parts
 					# Attention Decoder Prenet
 					prenet = Prenet(is_training, layers_sizes=hp.prenet_layers, drop_rate=hp.tacotron_dropout_rate,
@@ -202,47 +223,18 @@ class Tacotron():
 					frame_projection = FrameProjection(hp.num_mels * hp.outputs_per_step,
 													   scope='linear_transform_projection')
 					# <stop_token> projection layer
-					stop_projection = StopProjection(is_training or is_evaluating, shape=hp.outputs_per_step,
-													 scope='stop_token_projection')
+					stop_projection = None
 
-					# Decoder Cell ==> [batch_size, decoder_steps, num_mels * r] (after decoding)
-					if is_training:
-						align_dur=tf.transpose(tower_alignment_targets[i],perm=[1,0,2])
-						align_dur = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True).unstack(align_dur)
-						decoder_cell = TacotronDecoderCell(
-								prenet,
-								attention_mechanism,
-								decoder_lstm,
-								frame_projection,
-								stop_projection,
-								dur=align_dur,
-								is_training=is_training,
-								a=a)
-					else:
-						dur_int = tf.argmax(dur_out,axis=-1)
-						align_dur = tf.py_func(tf_convert_dur2alignment, [dur_int], Tout=tf.int32)
-						align_dur=tf.one_hot(indices=align_dur,
-											 depth=max_out_length,
-											 on_value=1.0, off_value=0.0, axis=-1
-											 ,dtype=tf.float32)
-						pad = align_dur[:, -1, :]
-						pad = tf.expand_dims(pad, axis=1)
-						pad = tf.tile(pad, [1, 700, 1])
-						align_dur = tf.concat([align_dur, pad], axis=1)
 
-						# convert tensor To TensorArray
-						align_dur=tf.transpose(align_dur,perm=[1,0,2])
-						align_dur = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True).unstack(align_dur)
-
-						decoder_cell = TacotronDecoderCell(
-							prenet,
-							attention_mechanism,
-							decoder_lstm,
-							frame_projection,
-							stop_projection,
-							dur=align_dur,
-							is_training=is_training,
-							a=a)
+					decoder_cell = TacotronDecoderCell(
+						prenet,
+						attention_mechanism,
+						decoder_lstm,
+						frame_projection,
+						stop_projection,
+						dur=align_dur,
+						a=a,
+						T_y=T_y)
 
 
 					# Define the helper for our decoder
@@ -270,6 +262,7 @@ class Tacotron():
 					decoder_output = tf.reshape(frames_prediction, [batch_size, -1, hp.num_mels])
 					stop_token_prediction = tf.reshape(stop_token_prediction, [batch_size, -1])
 
+
 					if hp.clip_outputs:
 						decoder_output = tf.minimum(
 							tf.maximum(decoder_output, T2_output_range[0] - hp.lower_bound_decay), T2_output_range[1])
@@ -284,6 +277,7 @@ class Tacotron():
 					# ==> [batch_size, decoder_steps * r, num_mels]
 					residual_projection = FrameProjection(hp.num_mels, scope='postnet_projection')
 					projected_residual = residual_projection(residual)
+
 
 					# Compute the mel spectrogram
 					mel_outputs = decoder_output + projected_residual
@@ -316,9 +310,11 @@ class Tacotron():
 
 					# Grab alignments from the final decoder state
 					alignments = tf.transpose(final_decoder_state.alignment_history.stack(), [2, 1 , 3, 0])
+
 					self.tower_dur_output.append(dur_out)
 					self.tower_decoder_output.append(decoder_output)
 					self.tower_alignments.append(alignments)
+
 					self.tower_stop_token_prediction.append(stop_token_prediction)
 					self.tower_mel_outputs.append(mel_outputs)
 					tower_embedded_inputs.append(embedded_inputs)
@@ -461,7 +457,7 @@ class Tacotron():
 					self.tower_regularization_loss.append(regularization)
 					self.tower_linear_loss.append(linear_loss)
 
-					tower_loss = before + after + stop_token_loss + regularization + linear_loss + dur
+					tower_loss = before + after  + regularization + linear_loss + dur
 					self.tower_loss.append(tower_loss)
 
 			total_before_loss += before
